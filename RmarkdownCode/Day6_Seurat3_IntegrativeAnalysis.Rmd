@@ -1,0 +1,613 @@
+---
+params:
+    dynamicTitle: "Project Report"
+    sampleSheet: "sampleInfo"
+title: "`r params$dynamicTitle`"
+author: "Hongyu Gao (mailto:hongao@iu.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    theme: default
+    highlight: tango
+    fig_captions: no
+    number_sections: false
+    css: ../style/style.css
+
+bibliography: ../singleCell.bib
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE, echo=FALSE}
+# List of packages required by this analysis
+depp<-c("bookdown", "Seurat", "dplyr", "DT", "knitr", "ggfortify", "ggrepel", "kableExtra", "cowplot", "circlize")
+# Check if the packages were installed if not install
+depp.new<-depp[!(depp%in%installed.packages())]
+if (length(depp.new)) {
+  install.packages(depp.new)
+}
+# List of bioconductor packages required by this analysis
+BioDepp<-c("ReactomePA", "Homo.sapiens", "Mus.musculus", "ComplexHeatmap")
+# Check if the packages were installed if not install
+BioDepp.new<-BioDepp[!(BioDepp%in%installed.packages())]
+if (length(BioDepp.new)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+    BiocManager::install(BioDepp, type="source")
+}
+# load required packages
+sapply(depp, library, character.only = TRUE)
+sapply(BioDepp, library, character.only = TRUE)
+```
+
+# Data setup
+
+This is an intergrated comparative analysis of two single cell datasets using Seurat development version 3.0.0.9200 [@satija2015spatial; @butler2018integrating; @stuart2019comprehensive; @hafemeister2019normalization].
+
+### `r text_spec("Load data and create Seurat objects", color = "#4d648d", font_size=16)`
+
+First read in the scRNA-seq datasets and set up Seurat objects (this includes filtering cells/gens).
+
+```{r Seurat_setup_objects, message=FALSE,warning=FALSE, echo=FALSE, results="hide"}
+## first read in the sample information sheet
+sampleInfo<-read.table(params$sampleSheet, header=T, sep="\t")
+
+## read data
+scRNA.list<-list()
+for (i in 1:nrow(sampleInfo)) {
+  ## read in 10X data
+  scData<-Read10X(data.dir = as.character(sampleInfo[i,3]))
+  ## change cell names
+  scData@Dimnames[2][[1]]<-paste0(as.character(sampleInfo[i,2]), "_", scData@Dimnames[2][[1]])
+  ## create Seurat object
+  scRNA <- CreateSeuratObject(scData, min.cells = 5, min.features = 200, project = as.character(sampleInfo[i,1]))
+  scRNA[['sample']] <- as.character(sampleInfo[i,2]) ## or scRNA@meta.data$sample<-sample
+  #scRNA[['condition']] <- as.character(sampleInfo[i,8])
+  ## mitochondrial genes
+  ref<-as.character(sampleInfo[i,4])
+  if (ref=="hg38") percent.mito <- percent.mito <- Matrix::colSums(GetAssayData(scRNA, slot = 'counts')[grep(pattern = "^MT-", rownames(scRNA), value = TRUE), ]) / Matrix::colSums(GetAssayData(scRNA, slot = 'counts'))
+
+  if (ref=="mm10") percent.mito <- percent.mito <- Matrix::colSums(GetAssayData(scRNA, slot = 'counts')[grep(pattern = "^mt-", rownames(scRNA), value = TRUE), ]) / Matrix::colSums(GetAssayData(scRNA, slot = 'counts'))
+  ## add to meta data
+  scRNA[['percent.mito']] <- percent.mito
+
+  ## filter data
+  scRNA <- subset(scRNA, subset = nFeature_RNA > sampleInfo[i,5] & nFeature_RNA < sampleInfo[i,6] & percent.mito < sampleInfo[i,7])
+  ## assign data to data list
+  scRNA.list[[i]]<-scRNA
+  rm(scRNA, scData)
+}
+## add name to the data list
+names(scRNA.list)<-as.character(sampleInfo[,2])
+
+## setup colors for plotting
+colors<-c("#4d648d", "#0450fb", "#11aac4", "#42e8f3", "#AEC7E8", "#2CA02C", "#98DF8A", "#9eccaf", "#daf400", "#983b59", "#e81f3f", "#ff8b94", "#ffd3b6", "#f9ae34", "#ffdb00", "#723584", "#9264eb", "#ff00ff", "#E377C2", "#de94e4", "#F7B6D2", "#C5B0D5", "#8C564B", "#C49C94", "#BCBD22", "#DBDB8D", "#7F7F7F", "#C7C7C7", "#a7a7b7", "#9999FF",  "#CC6633", "#990066", "#003333", "#996666")
+```
+
+### `r text_spec("Data preprocessing", color = "#4d648d", font_size=16)`
+
+After subsetting each dataset, each data will be log normalized and variable features will be identified with an improved methods based on a variance stabilizing transformation.
+
+```{r Seurat_preprocessing, message=FALSE,warning=FALSE, echo=FALSE, results="hide"}
+for (i in 1:length(scRNA.list)) {
+    scRNA.list[[i]] <- NormalizeData(scRNA.list[[i]], verbose = FALSE)
+    scRNA.list[[i]] <- FindVariableFeatures(scRNA.list[[i]], selection.method = "vst", nfeatures = 2500, verbose = FALSE)
+}
+```
+
+# Data Integration
+
+## Find integration anchors and integrate data
+
+```{r Seurat_FindIntegrationAnchors, message=FALSE,warning=FALSE, echo=FALSE, results='hide'}
+scRNA.anchors <- FindIntegrationAnchors(scRNA.list, dims = 1:40)
+scRNA.integrated <- IntegrateData(anchorset = scRNA.anchors, dims = 1:40)
+## switch to integrated assay, this is actually default
+DefaultAssay(object = scRNA.integrated) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+scRNA.integrated <- ScaleData(object = scRNA.integrated, verbose = FALSE)
+scRNA.integrated <- RunPCA(object = scRNA.integrated, npcs = 50, verbose = FALSE)
+```
+
+## Graph-based clustering
+
+Clusters were identified with the Seurat functions "FindNeighbors" and FindClusters" using a resolution of 1 and 40 PCs.
+
+```{r Seurat_cell_clustering, message=FALSE,warning=FALSE, echo=FALSE, results='hide'}
+scRNA.integrated <- FindNeighbors(scRNA.integrated, dims = 1:40, verbose=FALSE)
+scRNA.integrated <- FindClusters(scRNA.integrated, resolution = 1)
+
+scRNA.integrated <- RunUMAP(object = scRNA.integrated, reduction = "pca", dims = 1:40)
+scRNA.integrated <- RunTSNE(object = scRNA.integrated, reduction = "pca", dims = 1:40)
+
+# compare proportional shifts in the data (number of cells/data in each cluster)
+freq_table <- prop.table(x=table(scRNA.integrated@active.ident, scRNA.integrated@meta.data[,"sample"]), margin = 2)
+cellN<-data.frame(cbind(row.names(freq_table), table(scRNA.integrated@active.ident, scRNA.integrated@meta.data[,"sample"]), round(freq_table*100, 3), round(freq_table[,1]/freq_table[,2],2)))
+colnames(cellN)<-c("cell_cluster", colnames(freq_table)[1], colnames(freq_table)[2], paste0(colnames(freq_table)[1], "%"), paste0(colnames(freq_table)[2], "%"), paste0(paste0(colnames(freq_table)[1], "/", colnames(freq_table)[2]), " ", "ratio"))
+```
+
+### `r text_spec("T-SNE plots", color = "#4d648d", font_size=16)`
+
+```{r Seurat_tsne, message=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+DimPlot(scRNA.integrated, reduction = "tsne", group.by = "sample", cols=colors[seq(1, by=3, length(colors))][1:nrow(sampleInfo)]) + ggtitle("TSNE plot: colored by sample")
+DimPlot(scRNA.integrated, reduction = "tsne", label = TRUE, repel = TRUE, cols=colors[1:length(unique(scRNA.integrated@active.ident))]) + NoLegend() + ggtitle("TSNE plot: colored by cluster")
+DimPlot(scRNA.integrated, reduction = "tsne", label = FALSE, cols=colors[1:length(unique(scRNA.integrated@active.ident))])
+```
+
+###  `r text_spec("UMAP plots", color = "#4d648d", font_size=16)`
+
+#### UMAP: Uniform Manifold Approximation and Projection
+
+```{r Seurat_UMAP, message=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+DimPlot(scRNA.integrated, reduction = "umap", group.by = "sample", cols=colors[seq(1, by=3, length(colors))][1:nrow(sampleInfo)]) + ggtitle("UMAP plot: colored by sample")
+
+DimPlot(scRNA.integrated, reduction = "umap", label = TRUE, repel = FALSE, cols=colors[1:length(unique(scRNA.integrated@active.ident))]) + NoLegend() + ggtitle("UMAP plot: colored by cluster")
+DimPlot(scRNA.integrated, reduction = "umap", label = FALSE, cols=colors[1:length(unique(scRNA.integrated@active.ident))])
+```
+
+###  `r text_spec("UMAP plots separated by sample", color = "#4d648d", font_size=20)`
+
+```{r Seurat_plotsBySample, message=FALSE, warning=FALSE, echo=FALSE, fig.height=5, fig.width=12, results='asis'}
+## don't use the seurat function
+
+## first get the samples what have clusters missing
+## otherwise the colors on the umap will be differnet between samples
+cellN0.sample<-unique(as.vector(which(cellN[, 2:((ncol(cellN)+1)/2)]==0, arr.ind=TRUE)[,2]))
+
+samplePlot<-list()
+
+if (length(cellN0.sample)>0) {
+for (i in 1:length(unique(unlist(scRNA.integrated[['sample']])))) {
+	if (i %in% cellN0.sample) {
+		cellN0.cluster<-which(cellN[,i+1]==0)
+		samplePlot[[i]]<-DimPlot(subset(scRNA.integrated, cells=colnames(scRNA.integrated)[grep(unique(unlist(scRNA.integrated[['sample']]))[i], colnames(scRNA.integrated))]), reduction = "umap", label = TRUE,  cols=colors[1:length(unique(scRNA.integrated@active.ident))][-cellN0.cluster]) + NoLegend() + ggtitle(unique(unlist(scRNA.integrated[['sample']]))[i])
+	} else {
+		samplePlot[[i]]<-DimPlot(subset(scRNA.integrated, cells=colnames(scRNA.integrated)[grep(unique(unlist(scRNA.integrated[['sample']]))[i], colnames(scRNA.integrated))]), reduction = "umap", label = TRUE,  cols=colors[1:length(unique(scRNA.integrated@active.ident))]) + NoLegend() + ggtitle(unique(unlist(scRNA.integrated[['sample']]))[i])
+	}
+rm(cellN0.cluster)
+}}
+
+if (length(cellN0.sample)==0) {
+  for (i in 1:length(unique(unlist(scRNA.integrated[['sample']])))) samplePlot[[i]]<-DimPlot(subset(scRNA.integrated, cells=colnames(scRNA.integrated)[grep(unique(unlist(scRNA.integrated[['sample']]))[i], colnames(scRNA.integrated))]), reduction = "umap", label = TRUE,  cols=colors[1:length(unique(scRNA.integrated@active.ident))]) + NoLegend() + ggtitle(unique(unlist(scRNA.integrated[['sample']]))[i])
+}
+
+plot_grid(plotlist=samplePlot, ncol=2)
+```
+
+### `r text_spec("Number of cells in each cluster", color = "#4d648d", font_size=20)`
+
+#### Number of cells in each cluster from each data set
+
+```{r Seurat_cellN, message=FALSE,warning=FALSE, echo=FALSE, results='asis'}
+## since this is a short table, don't need page scroll
+brks <- quantile(c(as.numeric(as.character(cellN[, 4])), as.numeric(as.character(cellN[, 5]))), probs = seq(.05, .95, .05), na.rm = TRUE)
+clrs <- round(seq(255, 40, length.out = length(brks) + 1), 0) %>%
+{paste0("rgb(", ., ",", ., ",200)")}
+
+datatable(cellN, extensions = "Buttons", options = list(bPaginate = FALSE, dom = "Bfrtip", buttons = c('copy', 'csv', 'excel', 'pdf'))) %>% formatStyle(4:ncol(cellN), backgroundColor = styleInterval(brks, clrs))
+```
+
+## Identify conserved cell type markers
+
+The FindConservedMarkers function was used to identify canonical cell type marker genes that are conserved across conditions/treatments. The function performs differential gene expression for each group and combines the p-values using meta-analysis methods from the MetaDE R package.
+
+```{r Seurat_CellTypeMarkers, message=FALSE,warning=FALSE, echo=FALSE, results='hide'}
+## set Default assay to RNA for the following analysis
+DefaultAssay(scRNA.integrated) <- "RNA"
+## get the cell clusters
+uniqueC<-unique(scRNA.integrated@active.ident)[order(unique(scRNA.integrated@active.ident))]
+uniqueC<-as.numeric(as.character(uniqueC))[order(as.numeric(as.character(uniqueC)))]
+
+## if a cluster has <3 cells, will generate error in FindConservedMarkers: Cell group 1 has fewer than 3 cells
+## if no clusters present in only one condition
+## add a mean_avg_logFC column
+## order the markder by "mean_avg_logFC"
+sampleN1<-nrow(sampleInfo)+1
+smallCR<-unlist(sapply(2:sampleN1, function(i) which(as.numeric(as.character(cellN[,i]))<3)))
+smallCR<-unique(smallCR)[order(unique(smallCR))]
+smallC<-as.numeric(as.character(cellN[smallCR, 1]))
+smallC<-smallC[order(smallC)]
+
+
+if (length(smallC)>0) {
+    largeC<-uniqueC[-unlist(sapply(smallC, function(i) which(uniqueC==i, arr.ind=TRUE)))]
+    largeC<-as.numeric(as.character(largeC))
+    largeC<-largeC[order(largeC)]}
+if (length(smallC)==0) largeC<-uniqueC
+
+ct.markers<-list()
+if (length(smallC)>0) {
+       # ct.markers<-list()
+        for (i in largeC) {
+                k <- i+1
+                ct.markers[[k]]<-FindConservedMarkers(scRNA.integrated, ident.1 = i, assay.type = "RNA", grouping.var = "sample")
+                ct.markers[[k]]$avg_logFC<-rowMeans(ct.markers[[k]][grep("_avg_logFC", colnames(ct.markers[[k]]))])
+                ct.markers[[k]]$p_val<-ct.markers[[k]]$max_pval
+        }
+        for (p in smallC) {
+                m <- p+1
+                ct.markers[[m]]<-FindMarkers(scRNA.integrated, ident.1 = p, min.pct = 0.25, logfc.threshold = 0.25)
+       }
+}
+
+if (length(smallC)==0) {
+  #ct.markers<-list()
+        for (i in seq_along(uniqueC)) {
+                ct.markers[[i]]<-FindConservedMarkers(scRNA.integrated, ident.1 = uniqueC[i], assay.type = "RNA", grouping.var = "sample")
+                ct.markers[[i]]$avg_logFC<-rowMeans(ct.markers[[i]][grep("_avg_logFC", colnames(ct.markers[[i]]))])
+                ct.markers[[i]]$p_val<-ct.markers[[i]]$max_pval
+        }
+}
+
+## generate violin and feature plots top 9 cluster markers of each cluster
+## cluster have more than 0 marker genes
+cde<-which(sapply(ct.markers, nrow)>0, arr.ind=TRUE)
+clusterName<-paste0("cluster", "", cde-1)
+
+## positive markers
+ct.markers.pos<-lapply(seq_along(ct.markers), function(i) subset(ct.markers[[i]], avg_logFC>0))
+
+## violin plots of top 9 cluster markers
+vlnP<-lapply(cde, function(i) VlnPlot(scRNA.integrated, features= head(row.names(ct.markers.pos[[i]]), 9), ncol=3, cols=colors[1:length(unique(scRNA.integrated@active.ident))]) + theme(legend.position="none"))
+
+## feature plots of top 9 cluster markers
+feaP<-lapply(cde, function(i) FeaturePlot(scRNA.integrated, features= head(row.names(ct.markers.pos[[i]]), 9), cols=c("grey", "firebrick1"), reduction = "umap", ncol=3))
+
+## violin plots of top 9 cluster markers separated by sample
+vlnPS1<-lapply(cde, function(i) VlnPlot(scRNA.integrated, features= head(row.names(ct.markers.pos[[i]]), 9), split.by="sample", pt.size = 0, cols=c("grey", "firebrick1"), combine = FALSE))
+vlnPS2<-list()
+for (i in cde) vlnPS2[[i]]<-lapply(seq_along(vlnPS1[[i]]), function(j) vlnPS1[[i]][[j]] + xlab(""))
+## combine the plots
+vlnPS<-lapply(seq_along(vlnPS2), function(i) CombinePlots(vlnPS2[[i]], ncol = 2))
+
+## feature plots of top 9 cluster markers separated by sample
+feaHM<-lapply(cde, function(i) FeaturePlot(scRNA.integrated, features= head(row.names(ct.markers.pos[[i]]), 9), cols=c("grey", "firebrick1"), split.by = "sample"))
+
+##volcano plots of all cluster marker genes
+source("../scripts/VolcanoSC_integrativeAnalysis.r")
+VolcanoT<-paste0("Volcano plot for cluster ", cde-1, " marker genes")
+VolcanoP<-lapply(cde, function(i) VolcanoSC(ct.markers[[i]], 1e-10, 0.25, 1e-10, VolcanoT[i]))
+```
+
+## Data visulization
+
+### `r text_spec("Violin and feature plots ", color = "#4d648d", font_size=16)`
+
+#### Violin and feature plots for conserved marker genes of each cluster {.tabset .tabset-fade}
+
+```{r Seurat_CellTypeMarkers_vln-feaP, message=FALSE,warning=FALSE, echo=FALSE, fig.height=15, fig.width=15, results="asis"}
+#clusterName<-paste0("cluster", "", uniqueC)
+for (i in 1:length(vlnP)) {
+  cat("##### ",clusterName[i],"\n")
+  print(vlnP[[i]])
+  print(feaP[[i]])
+  cat('\n\n')
+}
+```
+
+### `r text_spec("violin plots separted by condition", color = "#4d648d", font_size=16)`
+
+#### Violin plots for conserved marker genes of each cluster separted by sample/condition/treatment {.tabset .tabset-fade}
+
+```{r Seurat_CellTypeMarkers_vlnps, message=FALSE,warning=FALSE, echo=FALSE, fig.height=20, fig.width=12, results="asis"}
+#clusterName<-paste0("cluster", "", uniqueC)
+for (i in 1:length(vlnPS)) {
+  cat("##### ",clusterName[i],"\n")
+  print(vlnPS[[i]])
+  cat('\n\n')
+}
+
+```
+
+### `r text_spec("Feature plots separated by condition", color = "#4d648d", font_size=16)`
+
+#### Feature plots for conserved marker genes of each cluster separated by sample/condition/treatment {.tabset .tabset-fade}
+
+```{r Seurat_CellTypeMarkers_vlnp, message=FALSE,warning=FALSE, echo=FALSE, fig.height=20, fig.width=12, results="asis"}
+#clusterName<-paste0("cluster", "", uniqueC)
+for (i in 1:length(feaHM)) {
+  cat("##### ",clusterName[i],"\n")
+  print(feaHM[[i]])
+  cat('\n\n')
+}
+
+```
+
+### `r text_spec("Volcano plots", color = "#4d648d", font_size=16)`
+
+####  Volcano Plots for all marker genes of each cluster {.tabset .tabset-fade}
+
+```{r Seurat_CellTypeMarkers_volcanoPlots, message=FALSE,warning=FALSE, echo=FALSE, fig.height=6, fig.width=6, results="asis"}
+#clusterName<-paste0("cluster", "", uniqueC)
+for (i in 1:length(VolcanoP)) {
+  cat("##### ",clusterName[i],"\n")
+  print(VolcanoP[[i]])
+  cat('\n\n')
+}
+```
+
+### `r text_spec("Reactome pathway", color = "#4d648d", font_size=16)`
+
+```{r Seurat_ReactomePA, message=FALSE,warning=FALSE, echo=FALSE, results="hide"}
+if (ref=="hg38") {
+        genes <- lapply(cde, function(i) select(Homo.sapiens, keys=row.names(ct.markers[[i]]), columns=c("ENTREZID", "GENENAME", "TXCHROM"), keytype="SYMBOL"))
+        pathEnrich<-lapply(seq_along(genes), function(i) enrichPathway(gene=genes[[i]][,2], pvalueCutoff=0.5, readable=T))
+}
+
+if (ref=="mm10") {
+        genes <- lapply(cde, function(i) select(Mus.musculus, keys=row.names(ct.markers[[i]]), columns=c("ENTREZID", "GENENAME", "TXCHROM"), keytype="SYMBOL"))
+        pathEnrich<-lapply(seq_along(genes), function(i) enrichPathway(gene=genes[[i]][,2], organism = "mouse", pvalueCutoff=0.5, readable=T))
+}
+
+dotP<-lapply(seq_along(genes), function(i) dotplot(pathEnrich[[i]], showCategory=30, title=paste0("cluster", "", (cde-1))))
+```
+
+#### Reactome path way analysis of the marker genes from each cluster {.tabset .tabset-fade}
+
+```{r Seurat_ReactomePA_plots, message=FALSE,warning=FALSE, echo=FALSE, fig.height=10, fig.width=15, results="asis"}
+for (i in 1:length(dotP)) {
+  cat("##### ",clusterName[i],"\n")
+  print(dotP[[i]])
+  cat('\n\n')
+}
+```
+
+
+```{r Seurat_CellTypeMarkers_rmData, message=FALSE,warning=FALSE, echo=FALSE, results="hide"}
+rm(vlnP, feaP, feaHM, VolcanoP)
+```
+
+### `r text_spec("Heatmap of each sample", color = "#4d648d", font_size=16)`
+
+
+```{r Seurat_HeatMap_plot1, message=FALSE,warning=FALSE, echo=FALSE, fig.height=5, fig.width=6, results="asis"}
+## genes tp label from the users
+sig.genes.label1<-c("LEF1", "DSP", "KRT19", "KRT13", "KRT17", "IGF1", "VIM", "LUM", "ELN", "CDK1", "CENPF", "COL6A3", "MATN1", "KRT4", "CLIC3", "EDNRB", "PLP1", "POSTN", "TRIL", "APCDD1", "TWIST2")
+
+## to generate heat map, need to use scaled data. But in the integrated data generated with seurat 3, only the hvg genes were scaled
+## the scale.data slot in RNA assay is empty
+scRNA.integrated.scaled <- ScaleData(object = scRNA.integrated, features=row.names(scRNA.integrated), vars.to.regress = c("nCount_RNA"), verbose = TRUE) ## will store in scRNA.integrated@assays$RNA@scale.data
+rm(scRNA.integrated)
+scRNA.integrated<-scRNA.integrated.scaled
+
+## get the genes to plot
+## add the cluster names
+ct.markers.sig<-list()
+ct.markers.sig[[1]]<-subset(ct.markers[[1]], (avg_logFC>0.4) & (max_pval<0.001))
+ct.markers.sig[[1]]$cluster<-rep(uniqueC[1], nrow(ct.markers.sig[[1]])) ## add the cluster information
+ct.markers.sig[[1]]$gene<-row.names(ct.markers.sig[[1]])
+for (i in seq_along(ct.markers)[-1]) {
+	ct.markers.sig[[i]]<-subset(ct.markers[[i]], (avg_logFC>0.4) & (max_pval<0.001))
+	ct.markers.sig[[i]]$cluster<-rep(uniqueC[i], nrow(ct.markers.sig[[i]]))
+	ct.markers.sig[[i]]$gene<-row.names(ct.markers.sig[[i]])
+	if (nrow(ct.markers.sig[[i]])>200) ct.markers.sig[[i]]<-ct.markers.sig[[i]][1:200, ]
+}
+
+## combine the above ct.markers.sig
+ct.markers.sigAll<-do.call(rbind, ct.markers.sig)
+## remove the duplicated rows (the same genes)
+ct.markers.sigAll<-ct.markers.sigAll[!duplicated(ct.markers.sigAll$gene), ]
+row.names(ct.markers.sigAll)<-ct.markers.sigAll$gene
+
+## significant gene names
+## sig.genes<-unique(unlist(sapply(seq_along(ct.markers), function(i) row.names(subset(ct.markers[[i]], (mean_avg_logFC>0.58) & (max_pval<0.001))))))
+sig.genes<-ct.markers.sigAll$gene
+#sig.genes<-unique(c(ct.markers.sigAll$gene, sig.genes.label1))
+
+## subset the data
+scRNA.integrated.1<-subset(scRNA.integrated, cells=colnames(scRNA.integrated)[grep(as.character(sampleInfo[,2])[1], colnames(scRNA.integrated))])
+## cluster information of the cells
+cellC1<-scRNA.integrated.1@active.ident[order(scRNA.integrated.1@active.ident, decreasing=FALSE)]
+
+## the matrix to be plotted with heat map
+geneM1<-GetAssayData(scRNA.integrated.1, assay="RNA", slot="scale.data")[sig.genes, names(cellC1)]
+
+## annotation for the columns (cells)
+ha1 = HeatmapAnnotation(df = data.frame(cluster = cellC1), col = list(cluster = c("0" =  colors[1], "1" =  colors[2], "2" =  colors[3], "3" =  colors[4], "4" =  colors[5], "5" =  colors[6], "6" =  colors[7], "7" =  colors[8], "8" =  colors[9], "9" =  colors[10], "10" =  colors[11], "11" =  colors[12], "12" =  colors[13], "13" =  colors[14], "14" =  colors[15], "15" =  colors[16], "16" =  colors[17], "17" =  colors[18], "18" =  colors[19], "19" =  colors[20], "20" =  colors[21], "21" =  colors[22], "22" =  colors[23], "23" =  colors[24], "24" =  colors[25], "25" =  colors[26], "26" =  colors[27], "27" =  colors[28], "28" =  colors[29])))
+
+## annotation for the rows (genes)
+geneC<-as.factor(ct.markers.sigAll$cluster)
+names(geneC)<-ct.markers.sigAll$gene
+
+cluster_color<-c("0" =  colors[1], "1" =  colors[2], "2" =  colors[3], "3" =  colors[4], "4" =  colors[5], "5" =  colors[6], "6" =  colors[7], "7" =  colors[8], "8" =  colors[9], "9" =  colors[10], "10" =  colors[11], "11" =  colors[12], "12" =  colors[13], "13" =  colors[14], "14" =  colors[15], "15" =  colors[16], "16" =  colors[17], "17" =  colors[18], "18" =  colors[19], "19" =  colors[20], "20" =  colors[21], "21" =  colors[22], "22" =  colors[23], "23" =  colors[24], "24" =  colors[25], "25" =  colors[26], "26" =  colors[27], "27" =  colors[28], "28" =  colors[29])
+
+## to label specific genes
+## use user provided gene list
+## to get the position of the genes to be labeled in geneM
+sig.genes.label<-intersect(sig.genes.label1, sig.genes)
+genes.label.p<-sapply(seq_along(sig.genes.label), function(i) which(row.names(geneM1)==sig.genes.label[i], arr.ind=TRUE))
+geneLabels<-row.names(geneM1)[unlist(genes.label.p)]
+
+## to generate the final heatmap
+ht_list = Heatmap(geneC, name = "", cluster_color, show_row_names = FALSE, show_heatmap_legend = FALSE, width = unit(4, "mm")) + Heatmap(geneM1, name = "expression", km = 0, col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")), heatmap_legend_param = list(legend_direction = "horizontal"), top_annotation = ha1, top_annotation_height = unit(4, "mm"), row_dend_reorder = FALSE, show_row_names = FALSE, show_column_names = FALSE, cluster_rows = FALSE, cluster_columns = FALSE, row_title_gp = gpar(fontsize = 0), row_names_gp = gpar(fontsize = 2)) + rowAnnotation(link = row_anno_link(at = genes.label.p, labels = geneLabels, labels_gp = gpar(fontsize = 8), padding = 0.5), width = unit(1, "cm") + max_text_width(geneLabels, gp = gpar(fontsize = 6)))
+
+draw(ht_list,
+    column_title = sampleInfo[,2][1],
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    merge_legends = FALSE, heatmap_legend_side = "bottom", annotation_legend_side = "right")
+```
+
+```{r Seurat_HeatMap_plot2, message=FALSE,warning=FALSE, echo=FALSE, fig.height=5, fig.width=6, results="asis"}
+rm(scRNA.integrated.1, cellC1, geneM1, geneC, ha1, sig.genes.label, genes.label.p, geneLabels, ht_list)
+
+## subset the data
+scRNA.integrated.1<-subset(scRNA.integrated, cells=colnames(scRNA.integrated)[grep(as.character(sampleInfo[,2])[2], colnames(scRNA.integrated))])
+## cluster information of the cells
+cellC1<-scRNA.integrated.1@active.ident[order(scRNA.integrated.1@active.ident, decreasing=FALSE)]
+
+## the matrix to be plotted with heat map
+#geneM1<-GetAssayData(scRNA.integrated.1, assay="RNA", slot="scale.data")[sig.genes, names(cellC1)]
+#sig.genes<-intersect(sig.genes, row.names(scRNA.integrated.1))
+geneM1<-GetAssayData(scRNA.integrated.1, assay="RNA", slot="scale.data")[sig.genes, names(cellC1)]
+
+## annotation for the columns (cells)
+ha1 = HeatmapAnnotation(df = data.frame(cluster = cellC1), col = list(cluster = c("0" =  colors[1], "1" =  colors[2], "2" =  colors[3], "3" =  colors[4], "4" =  colors[5], "5" =  colors[6], "6" =  colors[7], "7" =  colors[8], "8" =  colors[9], "9" =  colors[10], "10" =  colors[11], "11" =  colors[12], "12" =  colors[13], "13" =  colors[14], "14" =  colors[15], "15" =  colors[16], "16" =  colors[17], "17" =  colors[18], "18" =  colors[19], "19" =  colors[20], "20" =  colors[21], "21" =  colors[22], "22" =  colors[23], "23" =  colors[24], "24" =  colors[25], "25" =  colors[26], "26" =  colors[27], "27" =  colors[28], "28" =  colors[29])))
+
+## annotation for the rows (genes)
+geneC<-as.factor(ct.markers.sigAll$cluster)
+names(geneC)<-ct.markers.sigAll$gene
+
+## to label specific genes
+## use user provided gene list
+## to get the position of the genes to be labeled in geneM
+sig.genes.label<-intersect(sig.genes.label1, sig.genes)
+genes.label.p<-sapply(seq_along(sig.genes.label), function(i) which(row.names(geneM1)==sig.genes.label[i], arr.ind=TRUE))
+geneLabels<-row.names(geneM1)[unlist(genes.label.p)]
+
+## to generate the final heatmap
+ht_list = Heatmap(geneC, name = "", cluster_color, show_row_names = FALSE, show_heatmap_legend = FALSE, width = unit(4, "mm")) + Heatmap(geneM1, name = "expression", km = 0, col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")), heatmap_legend_param = list(legend_direction = "horizontal"), top_annotation = ha1, top_annotation_height = unit(4, "mm"), row_dend_reorder = FALSE, show_row_names = FALSE, show_column_names = FALSE, cluster_rows = FALSE, cluster_columns = FALSE, row_title_gp = gpar(fontsize = 0), row_names_gp = gpar(fontsize = 2)) + rowAnnotation(link = row_anno_link(at = genes.label.p, labels = geneLabels, labels_gp = gpar(fontsize = 8), padding = 0.5), width = unit(1, "cm") + max_text_width(geneLabels, gp = gpar(fontsize = 6)))
+
+draw(ht_list,
+    column_title = sampleInfo[,2][2],
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    merge_legends = FALSE, heatmap_legend_side = "bottom", annotation_legend_side = "right")
+```
+
+## Assigning cell type identity to clusters
+
+```{r cellType_annotation, message=FALSE,warning=FALSE, echo=FALSE, results='hide', fig.height=6, fig.width=12}
+new.cluster.ids<-c("0: Cycling Epithelial Cells", "1: Surface Ectoderm Cells", "2: Posterior Placodal Ectoderm",  "3: Cycling Epithelial Cells",  "4: Surface Ectoderm Cells", "5: Anterior Placode Ectoderm",  "6: Posterior Placode Ectoderm", "7: Surface Ectoderm Cells", "8: Neuroectoderm", "9: CNCC Mesenchyme", "10: Surface Ectoderm Cells", "11: Cycling Epithelial Cells", "12: Surface Ectoderm Cells", "13: CNCC Mesenchyme", "14: Surface Ectoderm", "15: Cycling Epithelial Cells", "16: Surface Ectoderm Cells", "17: CNCCs", "18: Posterior Placodal Ectoderm", "19: Cycling Neuroectoderm", "20: Low Mito Cells", "21: Neuroectoderm", "22: Neuroblasts", "23: Neuroblasts")
+
+scRNA.temp<-scRNA.integrated
+names(new.cluster.ids) <- levels(scRNA.temp)
+scRNA.temp <- RenameIdents(scRNA.temp, new.cluster.ids)
+
+DimPlot(scRNA.temp, reduction = "umap", label = FALSE, cols=colors[1:length(unique(scRNA.temp@active.ident))])
+rm(scRNA.temp)
+```
+
+# Genes expressed differently between conditions
+
+## Comparing average gene expression
+
+To look at the differences of gene expression in a same cell cluster/cell type induced by treatment/condition, one way is to plot the average gene expression of both conditions; genes that expressed differently can be visual outliers on a scatter plot.
+
+
+```{r Seurat_averageGeneExpression, message=FALSE,warning=FALSE, echo=FALSE, results='hide', fig.height=25, fig.width=12}
+#DefaultAssay(scRNA.integrated) <- "RNA"
+cluster.averages <- log1p(AverageExpression(scRNA.integrated, add.ident = "sample")$RNA)
+#cluster.averages$RNA
+## get the cluster names and column location in cluster.averages
+nms1<-paste0(largeC, "_", unique(scRNA.integrated[[]]$sample)[1])
+nms2<-paste0(largeC, "_", unique(scRNA.integrated[[]]$sample)[2])
+nmsp1<-unlist(sapply(seq_along(nms1), function(i) which(names(cluster.averages)==nms1[i], arr.ind=TRUE)))
+nmsp2<-unlist(sapply(seq_along(nms2), function(i) which(names(cluster.averages)==nms2[i], arr.ind=TRUE)))
+
+## further process the average expression matrix and add color information
+cluster.aexp<-list()
+geneN<-c()
+for (i in seq_along(largeC)) {
+    test<-cluster.averages[,c(nmsp1[i], nmsp2[i])]
+    test$ExprDiff<-test[,1]-test[,2]
+    test$FC<-log2(test[,1]/(test[,2]+0.0001))
+    test$gene<-""
+    test$color<-""
+
+    test1<-subset(test, (abs(ExprDiff)>=0.5) & (abs(FC)>=0.58))
+    if ((nrow(test1)>50) & (nrow(test1)<500)) test1<-rbind(subset(test, (abs(ExprDiff)>=0.5) & (abs(FC)>=10)), subset(test, (abs(ExprDiff)>=0.7) & (abs(FC)>=2)))
+    if (nrow(test1)>500) test1<-rbind(subset(test, (abs(ExprDiff)>=1) & (abs(FC)>=10)), subset(test, (abs(ExprDiff)>=1) & (abs(FC)>=2)))
+    #if (nrow(test1)>50) test1<-subset(test, (abs(ExprDiff)>=2) & (abs(FC)>=2))
+    #if (nrow(test1)>50) test1<-subset(test, (abs(ExprDiff)>=2) & (abs(FC)>=2))
+    test2<-test[setdiff(row.names(test), row.names(test1)), ]
+    test1<-test1[order(test1[,5]), ]
+    test1$gene<-row.names(test1)
+    test1$color<-ifelse(test1$ExprDiff>0, "darkred", "midnightblue")
+    #test1$color<-"darkred"
+    test2$color<-"gray"
+
+    rm(test)
+    test<-rbind(test1, test2)
+    cluster.aexp[[i]]<-test
+    geneN[i]<-nrow(test1)
+    rm(test, test1, test2)
+}
+
+## title for each graph
+tt<-sapply(seq_along(largeC), function(i) paste(paste("cluster", i-1, sep=" "), "average gene expression", sep=" "))
+
+p<-lapply(seq_along(largeC), function(i) ggplot(cluster.aexp[[i]], aes(cluster.aexp[[i]][,1], cluster.aexp[[i]][,2], label=gene)) + geom_point(color = cluster.aexp[[i]]$color, size=0.5) + geom_text_repel(color=cluster.aexp[[i]]$color, segment.color = "grey50", size=2, box.padding = unit(0.35, "lines"), point.padding = unit(0.3, "lines")) + ggtitle(tt[[i]]) + xlab(names(cluster.aexp[[i]])[1]) + ylab(names(cluster.aexp[[i]])[2]))
+```
+
+
+### `r text_spec("Scatter plots of average gene expression", color = "#4d648d", font_size=16)`
+
+#### Scatter plots of average gene expression between samples/conditions in the same cluster {.tabset .tabset-fade}
+
+```{r Seurat_CellTypeMarkers_averageEx, message=FALSE,warning=FALSE, echo=FALSE, fig.height=6, fig.width=6, results="asis"}
+clusterName<-paste0("cluster", "", largeC)
+for (i in 1:length(p)) {
+  cat("##### ",clusterName[i],"\n")
+  print(p[[i]])
+  #print(pHigh[[i]])
+  cat('\n\n')
+}
+```
+
+## DE genes within a cluster
+
+Another possible way to look at the differences of gene expression in a same cell cluster/cell type induced by treatment/condition is to find differentially expressed genes using the "FindMarkers" function for cells between different clusters (p-value<0.05 was used as a cutoff)
+
+
+```{r Seurat_conditionDE, message=FALSE,warning=FALSE, echo=FALSE, results='hide', fig.height=25, fig.width=12}
+uniqueC1<-paste0(uniqueC, "_", sampleInfo[,2][1])
+uniqueC2<-paste0(uniqueC, "_", sampleInfo[,2][2])
+
+scRNA.integrated$celltype.sample <- paste(Idents(scRNA.integrated), scRNA.integrated$sample, sep = "_")
+scRNA.integrated$celltype <- Idents(scRNA.integrated)
+Idents(scRNA.integrated) <- "celltype.sample"
+cluster.DE <- lapply(seq_along(largeC), function(i) FindMarkers(scRNA.integrated, ident.1 = uniqueC1[i], ident.2 = uniqueC2[i], verbose = FALSE))
+for (i in 1:length(cluster.DE)) cluster.DE[[i]]$gene<-row.names(cluster.DE[[i]])
+cluster.DEsg <- lapply(seq_along(largeC), function(i) subset(cluster.DE[[i]], p_val<0.05))
+```
+
+### `r text_spec("DE genes table within clusters", color = "#4d648d", font_size=16)`
+
+#### Table of DE genes between treatments/conditions of each cluster
+#### `r paste0("Comparison: ", sampleInfo[,2][1], "_Vs_", sampleInfo[,2][2])`
+
+```{r Seurat_clusterDE_DT, , message=FALSE,warning=FALSE, echo=FALSE}
+## unique marker genes from all clusters
+uMG<-unique(row.names(do.call(rbind, cluster.DEsg)))
+
+## get the genes that are different between each cluster and all clusters
+clusterDEMG<-lapply(seq_along(largeC), function(i) setdiff(uMG, row.names(cluster.DEsg[[i]])))
+## get the marker genes for each cluster including the ones not for the cluster
+clusterMG<-lapply(seq_along(largeC), function(i) rbind(cluster.DEsg[[i]][, c(6, 2, 5)], data.frame(gene=clusterDEMG[[i]], avg_logFC="", p_val_adj="")))
+
+## reorder the above data
+for (i in seq_along(clusterMG)) row.names(clusterMG[[i]])<-clusterMG[[i]][,1]
+for (i in 2:length(clusterMG)) clusterMG[[i]]<-clusterMG[[i]][row.names(clusterMG[[1]]), ]
+clusterMGall<-cbind(clusterMG[[1]], clusterMG[[2]][, 2:3])
+for (i in 3:length(clusterMG)) clusterMGall<-cbind(clusterMGall, clusterMG[[i]][, 2:3])
+colnames(clusterMGall)[2:ncol(clusterMGall)]<-paste(rep(paste("cluster", largeC, sep=""), each=2), c("avg_logFC", "p_val_adj"), sep=":")
+
+## round the scientific numbers
+for (i in seq(3,ncol(clusterMGall), by=2)) clusterMGall[,i]<-formatC(as.numeric(clusterMGall[, i]), format = "e", digits = 2)
+## for folder change, round
+for (i in seq(2,ncol(clusterMGall), by=2)) clusterMGall[,i]<-round(as.numeric(clusterMGall[, i]), digits = 2)
+## to replace NA with empty
+for (i in 2:ncol(clusterMGall)) clusterMGall[,i]<-gsub("\\ NA", "", clusterMGall[,i])
+
+## DT datatable
+## fix header and the gene name column
+## for a table with a large number of rows, render all rows on the page immediately since it will be slow
+datatable(clusterMGall, rownames=FALSE, extensions = c('Scroller', 'Buttons', 'FixedColumns'), options = list(
+  deferRender = TRUE, scrollY = 500,  scroller = TRUE, scrollX = TRUE,
+  fixedColumns = TRUE,
+  dom = "Bfrtip",
+  buttons = c('copy', 'csv', 'excel', 'pdf')))
+```
+
+#### `r text_spec("FYI, genes you are interested can be plotted with feature and/or violin plots separted by sample/condition/treatment within each cluster as what we have generated for the conserved cluster marker genes. ", color = "#4d648d", font_size="medium")`
+
+
+```{r saveData, include=FALSE, warning=FALSE, message=FALSE, echo=FALSE}
+## save merged seurat object
+#saveRDS(scRNA.integrated, file = "DSP_d6_WA25_d6_IntegrativeAnalysis.rds")
+## save cluster-specific marker genes
+#saveRDS(ct.markers, file = "DSP_d6_WA25_d6_IntegrativeAnalysis_clusterMarkerGenes.rds")
+```
+
+# References

@@ -1,0 +1,6 @@
+## run rmarkdown
+## can provide the full path of the required files
+rmarkdown::render("Day6_IntegrativeAnalysis.Rmd", params=list(
+       dynamicTitle = "Supplementary Data 3",
+       sampleSheet="../Day6_IntegrativeAnalysis_sampleInfo.txt"
+))

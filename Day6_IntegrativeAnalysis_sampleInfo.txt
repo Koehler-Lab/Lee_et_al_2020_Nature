@@ -1,0 +1,3 @@
+ProjectName	Sample	DataLocation	Reference	geneN_low	geneN_high	mito_high
+Day6_WA25-DSP	DSP_d6	/DSP_d6/outs/filtered_feature_bc_matrix	hg38	500	7500	0.20
+Day6_WA25-DSP	WA25_d6	/WA25_d6/outs/filtered_feature_bc_matrix	hg38	500	7500	0.20
